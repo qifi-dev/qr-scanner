@@ -25,6 +25,7 @@ declare class QrScanner {
     private _paused;
     private _flashOn;
     private _destroyed;
+    private _decodeMultiplexer?;
     constructor(video: HTMLVideoElement, onDecode: (result: QrScanner.ScanResult) => void, options: {
         onDecodeError?: (error: Error | string) => void;
         calculateScanRegion?: (video: HTMLVideoElement) => QrScanner.ScanRegion;
@@ -35,6 +36,7 @@ declare class QrScanner {
         overlay?: HTMLDivElement;
         /** just a temporary flag until we switch entirely to the new api */
         returnDetailedScanResult?: true;
+        decodeMultiplexer?: (canvasContext: CanvasRenderingContext2D, decode: () => Promise<void>) => Promise<void>;
     });
     /** @deprecated */
     constructor(video: HTMLVideoElement, onDecode: (result: string) => void, onDecodeError?: (error: Error | string) => void, calculateScanRegion?: (video: HTMLVideoElement) => QrScanner.ScanRegion, preferredCamera?: QrScanner.FacingMode | QrScanner.DeviceId);
@@ -60,7 +62,8 @@ declare class QrScanner {
         alsoTryWithoutScanRegion?: boolean;
         /** just a temporary flag until we switch entirely to the new api */
         returnDetailedScanResult?: true;
-    }): Promise<QrScanner.ScanResult>;
+        decodeMultiplexer?: (canvasContext: CanvasRenderingContext2D, decode: () => Promise<void>) => Promise<void>;
+    }): Promise<QrScanner.ScanResult | QrScanner.ScanResult[]>;
     /** @deprecated */
     static scanImage(imageOrFileOrBlobOrUrl: HTMLImageElement | HTMLVideoElement | HTMLCanvasElement | OffscreenCanvas | ImageBitmap | SVGImageElement | File | Blob | URL | String, scanRegion?: QrScanner.ScanRegion | null, qrEngine?: Worker | BarcodeDetector | Promise<Worker | BarcodeDetector> | null, canvas?: HTMLCanvasElement | null, disallowCanvasResizing?: boolean, alsoTryWithoutScanRegion?: boolean): Promise<string>;
     setGrayscaleWeights(red: number, green: number, blue: number, useIntegerApproximation?: boolean): void;

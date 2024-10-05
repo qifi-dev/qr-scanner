@@ -70,6 +70,7 @@ class QrScanner {
     private _paused: boolean = false;
     private _flashOn: boolean = false;
     private _destroyed: boolean = false;
+    private _decodeMultiplexer?: (canvasContext: CanvasRenderingContext2D, decode: () => Promise<void>) => Promise<void>;
 
     constructor(
         video: HTMLVideoElement,
@@ -84,6 +85,7 @@ class QrScanner {
             overlay?: HTMLDivElement,
             /** just a temporary flag until we switch entirely to the new api */
             returnDetailedScanResult?: true,
+            decodeMultiplexer?: (canvasContext: CanvasRenderingContext2D, decode: () => Promise<void>) => Promise<void>,
         },
     );
     /** @deprecated */
@@ -117,6 +119,7 @@ class QrScanner {
             overlay?: HTMLDivElement,
             /** just a temporary flag until we switch entirely to the new api */
             returnDetailedScanResult?: true,
+            decodeMultiplexer?: (canvasContext: CanvasRenderingContext2D, decode: () => Promise<void>) => Promise<void>,
         },
         canvasSizeOrCalculateScanRegion?: number | ((video: HTMLVideoElement) => QrScanner.ScanRegion),
         preferredCamera?: QrScanner.FacingMode | QrScanner.DeviceId,
@@ -164,6 +167,8 @@ class QrScanner {
         this._onLoadedMetaData = this._onLoadedMetaData.bind(this);
         this._onVisibilityChange = this._onVisibilityChange.bind(this);
         this._updateOverlay = this._updateOverlay.bind(this);
+
+        this._decodeMultiplexer = options.decodeMultiplexer;
 
         // @ts-ignore
         video.disablePictureInPicture = true;
@@ -219,8 +224,8 @@ class QrScanner {
                 this.$overlay.insertAdjacentHTML(
                     'beforeend',
                     '<svg class="code-outline-highlight" preserveAspectRatio="none" style="display:none;width:100%;'
-                        + 'height:100%;fill:none;stroke:#e9b213;stroke-width:5;stroke-dasharray:25;'
-                        + 'stroke-linecap:round;stroke-linejoin:round"><polygon/></svg>',
+                    + 'height:100%;fill:none;stroke:#e9b213;stroke-width:5;stroke-dasharray:25;'
+                    + 'stroke-linecap:round;stroke-linejoin:round"><polygon/></svg>',
                 );
                 this.$codeOutlineHighlight = this.$overlay.lastElementChild as SVGSVGElement;
             }
@@ -430,8 +435,9 @@ class QrScanner {
             alsoTryWithoutScanRegion?: boolean,
             /** just a temporary flag until we switch entirely to the new api */
             returnDetailedScanResult?: true,
+            decodeMultiplexer?: (canvasContext: CanvasRenderingContext2D, decode: () => Promise<void>) => Promise<void>,
         },
-    ): Promise<QrScanner.ScanResult>;
+    ): Promise<QrScanner.ScanResult | QrScanner.ScanResult[]>;
     /** @deprecated */
     static async scanImage(
         imageOrFileOrBlobOrUrl: HTMLImageElement | HTMLVideoElement | HTMLCanvasElement | OffscreenCanvas | ImageBitmap
@@ -453,14 +459,16 @@ class QrScanner {
             alsoTryWithoutScanRegion?: boolean,
             /** just a temporary flag until we switch entirely to the new api */
             returnDetailedScanResult?: true,
+            decodeMultiplexer?: (canvasContext: CanvasRenderingContext2D, decode: () => Promise<void>) => Promise<void>,
         } | null,
         qrEngine?: Worker | BarcodeDetector | Promise<Worker | BarcodeDetector> | null,
         canvas?: HTMLCanvasElement | null,
         disallowCanvasResizing: boolean = false,
         alsoTryWithoutScanRegion: boolean = false,
-    ): Promise<string | QrScanner.ScanResult> {
+    ): Promise<string | QrScanner.ScanResult | string[] | QrScanner.ScanResult[]> {
         let scanRegion: QrScanner.ScanRegion | null | undefined;
         let returnDetailedScanResult = false;
+        let decodeMultiplexer: ((canvasContext: CanvasRenderingContext2D, decode: () => Promise<void>) => Promise<void>) | undefined;
         if (scanRegionOrOptions && (
             'scanRegion' in scanRegionOrOptions
             || 'qrEngine' in scanRegionOrOptions
@@ -476,6 +484,7 @@ class QrScanner {
             disallowCanvasResizing = scanRegionOrOptions.disallowCanvasResizing || false;
             alsoTryWithoutScanRegion = scanRegionOrOptions.alsoTryWithoutScanRegion || false;
             returnDetailedScanResult = true;
+            decodeMultiplexer = scanRegionOrOptions.decodeMultiplexer;
         } else if (scanRegionOrOptions || qrEngine || canvas || disallowCanvasResizing || alsoTryWithoutScanRegion) {
             console.warn('You\'re using a deprecated api for scanImage which will be removed in the future.');
         } else {
@@ -490,114 +499,149 @@ class QrScanner {
 
         const gotExternalEngine = !!qrEngine;
 
-        try {
-            let image: HTMLImageElement | HTMLVideoElement | HTMLCanvasElement | OffscreenCanvas | ImageBitmap
-                | SVGImageElement;
-            let canvasContext: CanvasRenderingContext2D;
-            [qrEngine, image] = await Promise.all([
-                qrEngine || QrScanner.createQrEngine(),
-                QrScanner._loadImage(imageOrFileOrBlobOrUrl),
-            ]);
-            [canvas, canvasContext] = QrScanner._drawToCanvas(image, scanRegion, canvas, disallowCanvasResizing);
-            let detailedScanResult: QrScanner.ScanResult;
+        let image: HTMLImageElement | HTMLVideoElement | HTMLCanvasElement | OffscreenCanvas | ImageBitmap
+            | SVGImageElement;
+        let canvasContext: CanvasRenderingContext2D;
+        [qrEngine, image] = await Promise.all([
+            qrEngine || QrScanner.createQrEngine(),
+            QrScanner._loadImage(imageOrFileOrBlobOrUrl),
+        ]);
+        [canvas, canvasContext] = QrScanner._drawToCanvas(image, scanRegion, canvas, disallowCanvasResizing);
 
-            if (qrEngine instanceof Worker) {
-                const qrEngineWorker = qrEngine; // for ts to know that it's still a worker later in the event listeners
-                if (!gotExternalEngine) {
-                    // Enable scanning of inverted color qr codes.
-                    QrScanner._postWorkerMessageSync(qrEngineWorker, 'inversionMode', 'both');
-                }
-                detailedScanResult = await new Promise((resolve, reject) => {
-                    let timeout: number;
-                    let onMessage: (event: MessageEvent) => void;
-                    let onError: (error: ErrorEvent | string) => void;
-                    let expectedResponseId = -1;
-                    onMessage = (event: MessageEvent) => {
-                        if (event.data.id !== expectedResponseId) {
-                            return;
-                        }
-                        qrEngineWorker.removeEventListener('message', onMessage);
-                        qrEngineWorker.removeEventListener('error', onError);
-                        clearTimeout(timeout);
-                        if (event.data.data !== null) {
-                            resolve({
-                                data: event.data.data,
-                                cornerPoints: QrScanner._convertPoints(event.data.cornerPoints, scanRegion),
-                            });
-                        } else {
-                            reject(QrScanner.NO_QR_CODE_FOUND);
-                        }
-                    };
-                    onError = (error: ErrorEvent | string) => {
-                        qrEngineWorker.removeEventListener('message', onMessage);
-                        qrEngineWorker.removeEventListener('error', onError);
-                        clearTimeout(timeout);
-                        const errorMessage = !error ? 'Unknown Error' : ((error as ErrorEvent).message || error);
-                        reject('Scanner error: ' + errorMessage);
-                    };
-                    qrEngineWorker.addEventListener('message', onMessage);
-                    qrEngineWorker.addEventListener('error', onError);
-                    timeout = setTimeout(() => onError('timeout'), 10000);
-                    const imageData = canvasContext.getImageData(0, 0, canvas!.width, canvas!.height);
-                    expectedResponseId = QrScanner._postWorkerMessageSync(
-                        qrEngineWorker,
-                        'decode',
-                        imageData,
-                        [imageData.data.buffer],
-                    );
-                });
-            } else {
-                detailedScanResult = await Promise.race([
-                    new Promise<QrScanner.ScanResult>((resolve, reject) => window.setTimeout(
-                        () => reject('Scanner error: timeout'),
-                        10000,
-                    )),
-                    (async (): Promise<QrScanner.ScanResult> => {
-                        try {
-                            const [scanResult] = await qrEngine.detect(canvas!);
-                            if (!scanResult) throw QrScanner.NO_QR_CODE_FOUND;
-                            return {
-                                data: scanResult.rawValue,
-                                cornerPoints: QrScanner._convertPoints(scanResult.cornerPoints, scanRegion),
-                            };
-                        } catch (e) {
-                            const errorMessage = (e as Error).message || e as string;
-                            if (/not implemented|service unavailable/.test(errorMessage)) {
-                                // Not implemented can apparently for some reason happen even though getSupportedFormats
-                                // in createQrScanner reported that it's supported, see issue #98.
-                                // Service unavailable can happen after some time when the BarcodeDetector crashed and
-                                // can theoretically be recovered from by creating a new BarcodeDetector. However, in
-                                // newer browsers this issue does not seem to be present anymore and therefore we do not
-                                // apply this optimization anymore but just set _disableBarcodeDetector in both cases.
-                                // Also note that if we got an external qrEngine that crashed, we should possibly notify
-                                // the caller about it, but we also don't do this here, as it's such an unlikely case.
-                                QrScanner._disableBarcodeDetector = true;
-                                // retry without passing the broken BarcodeScanner instance
-                                return QrScanner.scanImage(imageOrFileOrBlobOrUrl, {
-                                    scanRegion,
-                                    canvas,
-                                    disallowCanvasResizing,
-                                    alsoTryWithoutScanRegion,
-                                });
+        const decode = async () => {
+            try {
+                let detailedScanResult: QrScanner.ScanResult | QrScanner.ScanResult[];
+
+                if (qrEngine instanceof Worker) {
+                    const qrEngineWorker = qrEngine; // for ts to know that it's still a worker later in the event listeners
+                    if (!gotExternalEngine) {
+                        // Enable scanning of inverted color qr codes.
+                        QrScanner._postWorkerMessageSync(qrEngineWorker, 'inversionMode', 'both');
+                    }
+                    detailedScanResult = await new Promise((resolve, reject) => {
+                        let timeout: number;
+                        let onMessage: (event: MessageEvent) => void;
+                        let onError: (error: ErrorEvent | string) => void;
+                        let expectedResponseId = -1;
+                        onMessage = (event: MessageEvent) => {
+                            if (event.data.id !== expectedResponseId) {
+                                return;
                             }
-                            throw `Scanner error: ${errorMessage}`;
-                        }
-                    })(),
-                ]);
-            }
-            return returnDetailedScanResult ? detailedScanResult : detailedScanResult.data;
-        } catch (e) {
-            if (!scanRegion || !alsoTryWithoutScanRegion) throw e;
-            const detailedScanResult = await QrScanner.scanImage(
-                imageOrFileOrBlobOrUrl,
-                { qrEngine, canvas, disallowCanvasResizing },
-            );
-            return returnDetailedScanResult ? detailedScanResult : detailedScanResult.data;
-        } finally {
-            if (!gotExternalEngine) {
-                QrScanner._postWorkerMessage(qrEngine!, 'close');
+                            qrEngineWorker.removeEventListener('message', onMessage);
+                            qrEngineWorker.removeEventListener('error', onError);
+                            clearTimeout(timeout);
+                            if (event.data.data !== null) {
+                                resolve({
+                                    data: event.data.data,
+                                    cornerPoints: QrScanner._convertPoints(event.data.cornerPoints, scanRegion),
+                                });
+                            } else {
+                                reject(QrScanner.NO_QR_CODE_FOUND);
+                            }
+                        };
+                        onError = (error: ErrorEvent | string) => {
+                            qrEngineWorker.removeEventListener('message', onMessage);
+                            qrEngineWorker.removeEventListener('error', onError);
+                            clearTimeout(timeout);
+                            const errorMessage = !error ? 'Unknown Error' : ((error as ErrorEvent).message || error);
+                            reject('Scanner error: ' + errorMessage);
+                        };
+                        qrEngineWorker.addEventListener('message', onMessage);
+                        qrEngineWorker.addEventListener('error', onError);
+                        timeout = setTimeout(() => onError('timeout'), 10000);
+                        const imageData = canvasContext.getImageData(0, 0, canvas!.width, canvas!.height);
+                        expectedResponseId = QrScanner._postWorkerMessageSync(
+                            qrEngineWorker,
+                            'decode',
+                            imageData,
+                            [imageData.data.buffer],
+                        );
+                    });
+                } else {
+                    detailedScanResult = await Promise.race([
+                        new Promise<QrScanner.ScanResult | QrScanner.ScanResult[]>((resolve, reject) => window.setTimeout(
+                            () => reject('Scanner error: timeout'),
+                            10000,
+                        )),
+                        (async (): Promise<QrScanner.ScanResult | QrScanner.ScanResult[]> => {
+                            try {
+                                const [scanResult] = await (qrEngine as BarcodeDetector).detect(canvas!);
+                                if (!scanResult) throw QrScanner.NO_QR_CODE_FOUND;
+                                return {
+                                    data: scanResult.rawValue,
+                                    cornerPoints: QrScanner._convertPoints(scanResult.cornerPoints, scanRegion),
+                                };
+                            } catch (e) {
+                                const errorMessage = (e as Error).message || e as string;
+                                if (/not implemented|service unavailable/.test(errorMessage)) {
+                                    // Not implemented can apparently for some reason happen even though getSupportedFormats
+                                    // in createQrScanner reported that it's supported, see issue #98.
+                                    // Service unavailable can happen after some time when the BarcodeDetector crashed and
+                                    // can theoretically be recovered from by creating a new BarcodeDetector. However, in
+                                    // newer browsers this issue does not seem to be present anymore and therefore we do not
+                                    // apply this optimization anymore but just set _disableBarcodeDetector in both cases.
+                                    // Also note that if we got an external qrEngine that crashed, we should possibly notify
+                                    // the caller about it, but we also don't do this here, as it's such an unlikely case.
+                                    QrScanner._disableBarcodeDetector = true;
+                                    // retry without passing the broken BarcodeScanner instance
+                                    return QrScanner.scanImage(imageOrFileOrBlobOrUrl, {
+                                        scanRegion,
+                                        canvas,
+                                        disallowCanvasResizing,
+                                        alsoTryWithoutScanRegion,
+                                        decodeMultiplexer,
+                                    });
+                                }
+                                throw `Scanner error: ${errorMessage}`;
+                            }
+                        })(),
+                    ]);
+                }
+
+                if (returnDetailedScanResult) {
+                    return detailedScanResult;
+                }
+                if (Array.isArray(detailedScanResult)) {
+                    return detailedScanResult.map(({ data }) => data);
+                }
+
+                return detailedScanResult.data;
+            } catch (e) {
+                if (!scanRegion || !alsoTryWithoutScanRegion) throw e;
+                const detailedScanResult = await QrScanner.scanImage(
+                    imageOrFileOrBlobOrUrl,
+                    { qrEngine, canvas, disallowCanvasResizing, decodeMultiplexer },
+                );
+
+                if (returnDetailedScanResult) {
+                    return detailedScanResult;
+                }
+                if (Array.isArray(detailedScanResult)) {
+                    return detailedScanResult.map(({ data }) => data);
+                }
+
+                return detailedScanResult.data;
+            } finally {
+                if (!gotExternalEngine) {
+                    QrScanner._postWorkerMessage(qrEngine!, 'close');
+                }
             }
         }
+
+        if (decodeMultiplexer !== undefined) {
+            const decodeResults: (string | QrScanner.ScanResult)[] = []
+            await decodeMultiplexer(canvasContext, async () => {
+                const results = await decode()
+                if (Array.isArray(results)) {
+                    decodeResults.push(...results)
+                } else {
+                    decodeResults.push(results)
+                }
+            });
+            return decodeResults as string[] | QrScanner.ScanResult[]
+        }
+
+        return decode();
     }
 
     setGrayscaleWeights(red: number, green: number, blue: number, useIntegerApproximation: boolean = true): void {
@@ -818,12 +862,13 @@ class QrScanner {
             // console.log('Scan rate:', Math.round(1000 / (Date.now() - this._lastScanTimestamp)));
             this._lastScanTimestamp = Date.now();
 
-            let result: QrScanner.ScanResult | undefined;
+            let resultOrResults: QrScanner.ScanResult | QrScanner.ScanResult[] | undefined;
             try {
-                result = await QrScanner.scanImage(this.$video, {
+                resultOrResults = await QrScanner.scanImage(this.$video, {
                     scanRegion: this._scanRegion,
                     qrEngine: this._qrEnginePromise,
                     canvas: this.$canvas,
+                    decodeMultiplexer: this._decodeMultiplexer,
                 });
             } catch (error) {
                 if (!this._active) return;
@@ -835,26 +880,28 @@ class QrScanner {
                 this._qrEnginePromise = QrScanner.createQrEngine();
             }
 
-            if (result) {
-                if (this._onDecode) {
-                    this._onDecode(result);
-                } else if (this._legacyOnDecode) {
-                    this._legacyOnDecode(result.data);
-                }
-
-                if (this.$codeOutlineHighlight) {
-                    clearTimeout(this._codeOutlineHighlightRemovalTimeout);
-                    this._codeOutlineHighlightRemovalTimeout = undefined;
-                    this.$codeOutlineHighlight.setAttribute(
-                        'viewBox',
-                        `${this._scanRegion.x || 0} `
+            if (resultOrResults) {
+                for (const result of Array.isArray(resultOrResults) ? resultOrResults : [resultOrResults]) {
+                    if (this._onDecode) {
+                        this._onDecode(result);
+                    } else if (this._legacyOnDecode) {
+                        this._legacyOnDecode(result.data);
+                    }
+    
+                    if (this.$codeOutlineHighlight) {
+                        clearTimeout(this._codeOutlineHighlightRemovalTimeout);
+                        this._codeOutlineHighlightRemovalTimeout = undefined;
+                        this.$codeOutlineHighlight.setAttribute(
+                            'viewBox',
+                            `${this._scanRegion.x || 0} `
                             + `${this._scanRegion.y || 0} `
                             + `${this._scanRegion.width || this.$video.videoWidth} `
                             + `${this._scanRegion.height || this.$video.videoHeight}`,
-                    );
-                    const polygon = this.$codeOutlineHighlight.firstElementChild!;
-                    polygon.setAttribute('points', result.cornerPoints.map(({x, y}) => `${x},${y}`).join(' '));
-                    this.$codeOutlineHighlight.style.display = '';
+                        );
+                        const polygon = this.$codeOutlineHighlight.firstElementChild!;
+                        polygon.setAttribute('points', result.cornerPoints.map(({ x, y }) => `${x},${y}`).join(' '));
+                        this.$codeOutlineHighlight.style.display = '';
+                    }
                 }
             } else if (this.$codeOutlineHighlight && !this._codeOutlineHighlightRemovalTimeout) {
                 // hide after timeout to make it flash less when on some frames the QR code is detected and on some not
@@ -904,7 +951,7 @@ class QrScanner {
                         )
                     );
                 return { stream, facingMode };
-            } catch (e) {}
+            } catch (e) { }
         }
 
         throw 'Camera not found.';
@@ -919,7 +966,7 @@ class QrScanner {
         await this.start();
     }
 
-    private static _stopVideoStream(stream : MediaStream): void {
+    private static _stopVideoStream(stream: MediaStream): void {
         for (const track of stream.getTracks()) {
             track.stop(); //  note that this will also automatically turn the flashlight off
             stream.removeTrack(track);
@@ -928,7 +975,7 @@ class QrScanner {
 
     private _setVideoMirror(facingMode: QrScanner.FacingMode): void {
         // in user facing mode mirror the video to make it easier for the user to position the QR code
-        const scaleFactor = facingMode === 'user'? -1 : 1;
+        const scaleFactor = facingMode === 'user' ? -1 : 1;
         this.$video.style.transform = 'scaleX(' + scaleFactor + ')';
     }
 
@@ -948,7 +995,7 @@ class QrScanner {
             | SVGImageElement,
         scanRegion?: QrScanner.ScanRegion | null,
         canvas?: HTMLCanvasElement | null,
-        disallowCanvasResizing= false,
+        disallowCanvasResizing = false,
     ): [HTMLCanvasElement, CanvasRenderingContext2D] {
         canvas = canvas || document.createElement('canvas');
         const scanRegionX = scanRegion && scanRegion.x ? scanRegion.x : 0;
@@ -977,7 +1024,7 @@ class QrScanner {
             }
         }
 
-        const context = canvas.getContext('2d', { alpha: false })!;
+        const context = canvas.getContext('2d', { alpha: false, willReadFrequently: true })!;
         context.imageSmoothingEnabled = false; // gives less blurry images
         context.drawImage(
             image,
@@ -991,7 +1038,7 @@ class QrScanner {
         imageOrFileOrBlobOrUrl: HTMLImageElement | HTMLVideoElement | HTMLCanvasElement | OffscreenCanvas | ImageBitmap
             | SVGImageElement | File | Blob | URL | String,
     ): Promise<HTMLImageElement | HTMLVideoElement | HTMLCanvasElement | OffscreenCanvas | ImageBitmap
-        | SVGImageElement > {
+        | SVGImageElement> {
         if (imageOrFileOrBlobOrUrl instanceof Image) {
             await QrScanner._awaitImageLoad(imageOrFileOrBlobOrUrl);
             return imageOrFileOrBlobOrUrl;
